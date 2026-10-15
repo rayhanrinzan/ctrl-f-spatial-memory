@@ -1,0 +1,38 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# local data — never commit
+backend/data/
+*.db
+*.sqlite*
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+recordings/
+runs/
+
+# model weights (downloaded on first run)
+*.pt
+*.onnx
+
+# misc
+.DS_Store
+*.log
+tmp/
