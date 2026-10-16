@@ -163,6 +163,8 @@ To test the real detector without a webcam, point `CTRLF_CAMERA_INDEX` at any vi
 |---|---|
 | "Camera unavailable" / `not authorized to capture video` | Run `check_camera.py` and grant camera permission to your terminal (see above) |
 | Wrong camera | Set `CTRLF_CAMERA_INDEX=1` (or 2…) |
+| Camera pops up on your iPhone, then disappears | macOS made the iPhone (Continuity Camera) index 0. Use `CTRLF_CAMERA_INDEX=1` for the built-in FaceTime camera |
+| Works in Terminal but not when started from an IDE/agent app | macOS grants camera access per app. Start the backend from a terminal app that has permission |
 | Objects flicker between regions | Raise `CTRLF_STABILITY_FRAMES`, or move the object further from region borders |
 | Object not detected | Use good lighting and a clear view, try lowering `CTRLF_CONFIDENCE` to 0.3, and use a supported class |
 | Mic button disabled | The browser lacks the Web Speech API (e.g. Firefox). Type instead |

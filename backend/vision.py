@@ -53,6 +53,7 @@ class VisionWorker(threading.Thread):
         class_ids = [i for i, n in model.names.items() if n in ALIASES]
 
         cap = None
+        failures = 0
         while not self._halt.is_set():
             if cap is None or not cap.isOpened():
                 cap = self._open_camera()
@@ -65,11 +66,21 @@ class VisionWorker(threading.Thread):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop test video files
                 ok, frame = cap.read()
             if not ok or frame is None:
-                self.status.update(camera="error", error="Camera read failed; retrying")
-                cap.release()
-                cap = None
-                self._halt.wait(1.0)
+                # Cameras (esp. macOS / Continuity Camera) return empty frames while warming up;
+                # only reopen after a sustained run of failures.
+                failures += 1
+                if failures >= 50:
+                    self.status.update(camera="error", error="Camera read failed; reopening")
+                    cap.release()
+                    cap = None
+                    failures = 0
+                    self._halt.wait(2.0)
+                else:
+                    self._halt.wait(0.1)
                 continue
+            failures = 0
+            if self.status["camera"] != "active":
+                self.status.update(camera="active", error=None)
             frame = self._resize(frame)
             try:
                 obs = self._detect(model, frame, class_ids)
