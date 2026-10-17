@@ -19,6 +19,7 @@ ALIASES: dict[str, list[str]] = {
     "remote": ["remote", "tv remote", "controller"],
     "scissors": ["scissors"],
     "mouse": ["mouse", "computer mouse"],
+    "laptop": ["laptop", "macbook", "computer", "notebook computer"],
 }
 SUPPORTED = list(ALIASES)
 

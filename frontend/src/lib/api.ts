@@ -33,6 +33,7 @@ export interface Health {
   status: string
   camera: 'starting' | 'active' | 'error' | 'stopped' | 'disabled'
   error: string | null
+  warning?: string | null
   fps: number
   detections: { category: string; confidence: number; track_id: number | null }[]
   supported: string[]

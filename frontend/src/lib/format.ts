@@ -1,4 +1,4 @@
-import { Backpack, BookOpen, Coffee, Milk, Mouse, Package, Scissors, Smartphone, Tv } from 'lucide-react'
+import { Backpack, BookOpen, Coffee, Laptop, Milk, Mouse, Package, Scissors, Smartphone, Tv } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 
 const ICONS: Record<string, LucideIcon> = {
@@ -10,6 +10,7 @@ const ICONS: Record<string, LucideIcon> = {
   remote: Tv,
   scissors: Scissors,
   mouse: Mouse,
+  laptop: Laptop,
 }
 
 export const iconFor = (category: string): LucideIcon => ICONS[category] ?? Package

@@ -81,6 +81,9 @@ class VisionWorker(threading.Thread):
             failures = 0
             if self.status["camera"] != "active":
                 self.status.update(camera="active", error=None)
+            dark = float(frame[::8, ::8].mean()) < 8  # e.g. Continuity Camera paused or lens covered
+            self.status["warning"] = ("Camera is sending black frames. Check the lens isn't covered "
+                                      "and the iPhone is locked and still.") if dark else None
             frame = self._resize(frame)
             try:
                 obs = self._detect(model, frame, class_ids)

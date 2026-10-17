@@ -36,6 +36,7 @@ These are COCO classes that YOLO11n actually recognizes (checked against `model.
 | remote | remote, TV remote |
 | scissors | scissors |
 | mouse | mouse |
+| laptop | laptop, MacBook, computer |
 
 Keys, wallets and headphones are **not** COCO classes and aren't supported yet. For a reliable demo, use a bottle, cup or phone.
 

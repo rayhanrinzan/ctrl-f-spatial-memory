@@ -29,6 +29,9 @@ export function CameraPanel({ health }: { health: Health | null }) {
           </div>
         )}
       </div>
+      {active && health.warning && (
+        <p className="border-t border-zinc-800 px-4 py-2 text-xs text-amber-300">{health.warning}</p>
+      )}
       {active && (
         <div className="flex min-h-10 flex-wrap gap-1.5 px-4 py-2.5">
           {health.detections.length === 0 ? (

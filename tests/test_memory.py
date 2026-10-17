@@ -110,6 +110,9 @@ def test_query_parsing():
     assert parse_query("Where did I leave my bottle?")[0] == "bottle"
     assert parse_query("Have you seen my cup?")[0] == "cup"
     assert parse_query("where are my keys") is None
+    assert parse_query("where's my laptop")[0] == "laptop"
+    assert parse_query("where is my computer")[0] == "laptop"
+    assert parse_query("where is my computer mouse")[0] == "mouse"
 
 
 def test_query_answers(mem, db):
