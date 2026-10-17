@@ -1,30 +1,138 @@
+"""API round-trips with the camera disabled; observations are injected synthetically."""
 import importlib
-from datetime import datetime, timedelta, timezone
+import shutil
+from pathlib import Path
 
+import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
+from conftest import BED, DESK, Clock, obs
 
-def test_api_roundtrip(tmp_path, monkeypatch):
+BACKEND = Path(__file__).parent.parent / "backend"
+
+
+@pytest.fixture
+def api(tmp_path, monkeypatch):
+    shutil.copy(BACKEND / "regions.json", tmp_path / "regions.json")
     monkeypatch.setenv("CTRLF_CAMERA_ENABLED", "0")
     monkeypatch.setenv("CTRLF_DB_PATH", str(tmp_path / "api.db"))
-    monkeypatch.setenv("CTRLF_STABILITY_FRAMES", "2")
+    monkeypatch.setenv("CTRLF_SNAPSHOT_DIR", str(tmp_path / "snaps"))
+    monkeypatch.setenv("CTRLF_REGIONS", str(tmp_path / "regions.json"))
     import main
     main = importlib.reload(main)
-    from memory import Observation
-
     with TestClient(main.app) as c:
-        assert c.get("/api/health").json()["camera"] == "disabled"
-        assert len(c.get("/api/regions").json()) == 3
-        t = datetime.now(timezone.utc)
-        for i in range(2):  # synthetic observations, labeled as such
-            main.memory.observe([Observation("cell phone", 0.8, 0.9, 0.5)], now=t + timedelta(seconds=i))
-        objs = c.get("/api/objects").json()
-        assert objs[0]["region"] == "Bed"
-        assert c.get("/api/objects/cell_phone_01").json()["name"] == "Cell Phone"
-        assert c.get("/api/objects/phone").json()["region"] == "Bed"
-        assert c.get("/api/objects/nope").status_code == 404
-        assert c.post("/api/query", json={"text": "where's my phone"}).json()["found"]
-        assert c.get("/api/events").json()[0]["to_region"] == "Bed"
-        assert c.get("/api/camera").status_code == 503
-        assert c.delete("/api/memory").json() == {"cleared": True}
-        assert c.get("/api/objects").json() == []
+        yield c, main
+
+
+def inject(main, *observations, n=6, clock=None):
+    """Synthetic detections through the same path the live worker uses (memory -> snapshots)."""
+    clock = clock or Clock(main.memory)
+    frame = np.full((360, 640, 3), 100, np.uint8)
+    for ev in clock.frames(n, *observations):
+        main.snapshots.submit(ev, frame)
+    main.snapshots.flush()
+    return clock
+
+
+def test_catalog_and_never_seen_objects(api):
+    c, _ = api
+    objs = c.get("/api/objects").json()
+    assert [o["name"] for o in objs] == ["Phone", "Water Bottle", "Laptop", "Cup", "Book",
+                                         "Backpack", "Remote", "Mouse"]
+    assert all(o["status"] == "never" and o["region"] is None and o["snapshot"] is None for o in objs)
+    assert len(c.get("/api/catalog").json()) == 8
+    assert c.get("/api/health").json()["camera"] == "disabled"
+
+
+def test_object_snapshot_and_query_flow(api):
+    c, main = api
+    clock = inject(main, obs("bottle", DESK))
+    phone = c.get("/api/objects/phone").json()
+    assert phone["status"] == "never"
+    bottle = c.get("/api/objects/bottle_01").json()
+    assert bottle["status"] == "visible" and bottle["region"] == "Desk"
+    snap = bottle["snapshot"]
+    assert snap["event_type"] == "first_seen" and len(snap["bbox"]) == 4
+    img = c.get(snap["image_url"])
+    assert img.status_code == 200 and img.headers["content-type"] == "image/jpeg"
+    assert c.get("/api/snapshots/9999/image").status_code == 404
+
+    clock.frames(15)  # leaves view
+    r = c.post("/api/query", json={"text": "My water bottle"}).json()
+    assert r["found"] and r["object"]["snapshot"]["id"] == snap["id"]
+    assert r["object"]["status"] == "last_seen" and "out of view" in r["answer"]
+    bad = c.post("/api/query", json={"text": "where are my keys"}).json()
+    assert bad["found"] is False and bad["object"] is None
+    assert c.get("/api/objects/bottle_01/snapshots").json()[0]["id"] == snap["id"]
+    assert c.get("/api/events").json()[0]["event_type"] == "first_seen"
+
+
+def test_list_and_map_share_one_object_state(api):
+    c, main = api
+    inject(main, obs("cup", BED))
+    listing = {o["object_id"]: o for o in c.get("/api/objects").json()}
+    detail = c.get("/api/objects/cup_01").json()
+    assert listing["cup_01"] == detail  # both views render this exact record
+
+
+def test_settings_toggle_capture(api):
+    c, main = api
+    assert c.put("/api/settings", json={"capture_enabled": False}).json() == {"capture_enabled": False}
+    inject(main, obs("book", DESK))
+    book = c.get("/api/objects/book_01").json()
+    assert book["region"] == "Desk" and book["snapshot"] is None
+    assert c.get("/api/health").json()["capture_enabled"] is False
+
+
+def test_clear_memory_removes_photos(api):
+    c, main = api
+    inject(main, obs("bottle", DESK))
+    assert list(main.snapshots.dir.glob("*.jpg"))
+    assert c.delete("/api/memory").json() == {"cleared": True}
+    assert all(o["status"] == "never" for o in c.get("/api/objects").json())
+    assert list(main.snapshots.dir.glob("*.jpg")) == []
+
+
+def test_reposition_flow_preserves_history(api):
+    c, main = api
+    clock = inject(main, obs("bottle", DESK))
+    old_snap = c.get("/api/objects/bottle_01").json()["snapshot"]
+
+    assert c.post("/api/reposition/start").json()["mode"] == "REPOSITIONING"
+    assert c.post("/api/reposition/start").status_code == 409
+    inject(main, obs("bottle", BED), n=20, clock=clock)  # camera swinging around
+    assert len(c.get("/api/events").json()) == 1
+    assert c.get("/api/objects/bottle_01/snapshots").json() == [old_snap]
+
+    assert c.post("/api/reposition/finish").json()["mode"] == "CALIBRATING"
+    assert c.get("/api/calibration/reference").status_code == 404
+    main.modes.on_frame(0.0, lambda: b"jpeg")  # worker sees a steady view
+    for _ in range(5):
+        main.modes.on_frame(0.0, lambda: b"jpeg")
+    assert c.get("/api/calibration/reference").content == b"jpeg"
+
+    new = [{"name": "Desk", "camera": [0.5, 0, 1, 1], "map": [0.04, 0.06, 0.36, 0.4]},
+           {"name": "Bed", "camera": [0, 0, 0.5, 1], "map": [0.5, 0.48, 0.96, 0.94]}]
+    assert c.put("/api/regions", json={"regions": [{"name": "X", "camera": [0.5, 0, 0.4, 1]}]}).status_code == 422
+    assert [r["name"] for r in c.put("/api/regions", json={"regions": new}).json()] == ["Desk", "Bed"]
+    assert c.get("/api/health").json()["mode"] == "READY_TO_RESUME"
+    assert c.post("/api/reposition/resume").json()["mode"] == "MONITORING"
+
+    bottle = c.get("/api/objects/bottle_01").json()
+    assert bottle["awaiting_reconfirmation"] and bottle["snapshot"]["id"] == old_snap["id"]
+    inject(main, obs("bottle", (0.8, 0.5)), clock=clock)  # now inside the recalibrated Desk
+    bottle = c.get("/api/objects/bottle_01").json()
+    assert bottle["region"] == "Desk" and not bottle["awaiting_reconfirmation"]
+    assert bottle["snapshot"]["event_type"] == "reconfirmed"
+    assert [e["event_type"] for e in c.get("/api/events").json()] == ["first_seen"]
+    assert len(c.get("/api/objects/bottle_01/snapshots").json()) == 2  # old photo kept
+
+
+def test_cancel_reposition(api):
+    c, main = api
+    view = main.memory.view_id
+    c.post("/api/reposition/start")
+    assert c.post("/api/reposition/resume").status_code == 409
+    assert c.post("/api/reposition/cancel").json()["mode"] == "MONITORING"
+    assert main.memory.view_id == view and not main.memory.paused
