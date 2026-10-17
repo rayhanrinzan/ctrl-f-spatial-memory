@@ -1,14 +1,36 @@
+export type ObjectStatus = 'visible' | 'last_seen' | 'never'
+export type Mode = 'MONITORING' | 'REPOSITIONING' | 'CALIBRATING' | 'READY_TO_RESUME'
+
+export interface Snapshot {
+  id: number
+  object_id: string
+  event_type: 'first_seen' | 'moved' | 'moved_within' | 'reconfirmed'
+  timestamp: string
+  region: string
+  bbox: [number, number, number, number]
+  confidence: number
+  view_id: string | null
+  image_url: string
+}
+
+/** The one canonical object record, shared by List, Map, detail and voice. */
 export interface TrackedObject {
   object_id: string
   category: string
   name: string
+  icon: string
+  seen: boolean
+  status: ObjectStatus
   region: string | null
   x: number | null
   y: number | null
-  last_seen: string
+  last_seen: string | null
   visible: boolean
   confidence: number | null
-  track_id: number | null
+  moving: boolean
+  awaiting_reconfirmation: boolean
+  lost_while_moving: boolean
+  snapshot: Snapshot | null
 }
 
 export interface MoveEvent {
@@ -18,6 +40,7 @@ export interface MoveEvent {
   from_region: string | null
   to_region: string
   timestamp: string
+  event_type: 'first_seen' | 'moved' | 'moved_within'
 }
 
 export interface Region {
@@ -33,10 +56,13 @@ export interface Health {
   status: string
   camera: 'starting' | 'active' | 'error' | 'stopped' | 'disabled'
   error: string | null
-  warning?: string | null
+  warning: string | null
   fps: number
-  detections: { category: string; confidence: number; track_id: number | null }[]
-  supported: string[]
+  detections: { category: string; name: string; confidence: number }[]
+  mode: Mode
+  reference_ready: boolean
+  view_id: string
+  capture_enabled: boolean
 }
 
 export interface QueryResult {
@@ -45,23 +71,46 @@ export interface QueryResult {
   object: TrackedObject | null
 }
 
+export class ApiError extends Error {
+  status: number
+  constructor(status: number, message: string) {
+    super(message)
+    this.status = status
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, init)
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+  let res: Response
+  try {
+    res = await fetch(`/api${path}`, init)
+  } catch {
+    throw new ApiError(0, "Can't reach Keepsake. Is the backend running?")
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => null)
+    throw new ApiError(res.status, body?.detail ?? `Request failed (${res.status})`)
+  }
   return res.json() as Promise<T>
 }
+
+const json = (method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+})
 
 export const api = {
   health: () => req<Health>('/health'),
   regions: () => req<Region[]>('/regions'),
   objects: () => req<TrackedObject[]>('/objects'),
+  snapshots: (id: string) => req<Snapshot[]>(`/objects/${id}/snapshots`),
   events: (limit = 20) => req<MoveEvent[]>(`/events?limit=${limit}`),
-  query: (text: string) =>
-    req<QueryResult>('/query', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    }),
+  query: (text: string) => req<QueryResult>('/query', json('POST', { text })),
   clear: () => req<{ cleared: boolean }>('/memory', { method: 'DELETE' }),
+  setCapture: (enabled: boolean) => req<{ capture_enabled: boolean }>('/settings', json('PUT', { capture_enabled: enabled })),
+  reposition: (step: 'start' | 'cancel' | 'finish' | 'resume') => req<{ mode: Mode }>(`/reposition/${step}`, json('POST')),
+  saveRegions: (regions: { name: string; camera: number[]; map: number[] }[]) =>
+    req<Region[]>('/regions', json('PUT', { regions })),
   cameraUrl: '/api/camera',
+  referenceUrl: '/api/calibration/reference',
 }

@@ -1,173 +1,174 @@
-# Ctrl+F — Spatial Memory
+# Keepsake
 
-> *You shouldn't have to remember what you need to remember.*
+> *Your room remembers, so you don't have to.*
 
-Ctrl+F watches a room through a stationary webcam, recognizes everyday objects with YOLO, and remembers the **last place each one was seen**. A web dashboard shows a 2D map of the room, and you can ask "Where is my phone?" by typing or speaking.
+Keepsake watches a room through one camera, recognizes eight everyday items, and remembers **where each was last seen, with a photo as evidence**. Open Keepsake, tap an item, and see the photo. Or press **Voice**, say "my water bottle", and hear where it was.
 
-Everything runs locally. Video frames are processed in memory and never saved.
+Built for HackHarvard 2026. Everything runs on your own computer.
 
 ## How it works
 
 ```
-webcam ─► OpenCV ─► YOLO11n + ByteTrack ─► box center ─► region (Desk/Dresser/Bed)
-                                                         │
-                         stability filter (N sightings in a row) ─► SQLite (objects, events)
-                                                         │
-React dashboard ◄── FastAPI (localhost:8000) ◄───────────┘
+camera ─► OpenCV ─► YOLO11n + ByteTrack ─► region (Desk / Dresser / Bed)
+            │                                  │
+            └─ frame differencing (motion) ────┤
+                                               ▼
+              per-object state machine: STABLE → POSSIBLE_CHANGE → MOVING → SETTLING → CONFIRMED
+                                               │ (only after the object holds still)
+                         SQLite (objects, events, snapshots) + JPEG photo on disk
+                                               │
+     React app (List · Map · Voice · Reposition) ◄── FastAPI on 127.0.0.1:8000
 ```
 
-- **Detection:** Ultralytics YOLO11 nano (COCO classes), CPU, about 5 inferences per second.
-- **Tracking:** Ultralytics' built-in ByteTrack. Track IDs are temporary. The MVP assumes **one object per category**, so a new track ID is re-associated with the existing record by category.
-- **Regions:** normalized rectangles in camera space ([backend/regions.json](backend/regions.json)). An object's region is the one containing its bounding-box center.
-- **Movement:** the stored region changes only after the object is seen in a new region for `CTRLF_STABILITY_FRAMES` consecutive frames (default 5, about 1 second) with confidence ≥ `CTRLF_CONFIDENCE`. Each change is logged as `object → from → to → timestamp`.
-- **Last seen:** when an object leaves the view, its location is kept and it is marked *not currently visible* after `CTRLF_ABSENCE_SECONDS`.
-
-## Supported objects
-
-These are COCO classes that YOLO11n actually recognizes (checked against `model.names`):
-
-| Category | Ask with |
-|---|---|
-| bottle | bottle, water bottle |
-| cup | cup, mug |
-| cell phone | phone, cell phone, iPhone |
-| book | book, notebook |
-| backpack | backpack, bag |
-| remote | remote, TV remote |
-| scissors | scissors |
-| mouse | mouse |
-| laptop | laptop, MacBook, computer |
-
-Keys, wallets and headphones are **not** COCO classes and aren't supported yet. For a reliable demo, use a bottle, cup or phone.
-
-## Requirements
-
-- macOS, Linux or Windows with a webcam
-- Python 3.11+ (developed with 3.12)
-- Node.js 20+ (developed with 24)
+- **Detection:** pretrained Ultralytics YOLO11n (COCO classes) on the CPU at about 5 fps. There's no training, no cloud vision, and no YOLO-World.
+- **Tracked items** (in [backend/catalog.py](backend/catalog.py)): Phone, Water Bottle, Laptop, Cup, Book, Backpack, Remote, Mouse. The app assumes one of each.
+- **When a photo is taken:** an item must be seen first (first sighting), moved to another area, or moved more than `CTRLF_MOVE_THRESHOLD` (6% of the frame) within the same area. It must then **settle**: stay within a small radius for `CTRLF_SETTLE_SECONDS` (0.8 s) and at least `CTRLF_STABILITY_FRAMES` frames, with little motion around it. Only then does Keepsake update the location and save a photo. It picks the clearest frame from that settled window, skipping frames where a detected person covers the item.
+- **What doesn't trigger a photo:** someone walking past, jitter, an item picked up and put back in the same spot, or a brief misdetection.
+- **Leaving view:** the last confirmed place and photo are kept, and the item shows **Out of view**. If it was mid-move when it vanished, Keepsake says so instead of claiming it's still there.
+- **Photos:** full camera frames, with the item's box stored as metadata and highlighted in the app. Each item keeps its 20 most recent (`CTRLF_SNAPSHOT_RETENTION`). Photos taken within 3 s of each other at the same spot are skipped as duplicates. Photos are written by a background thread, so detection never waits on the disk.
 
 ## Install
 
 ```bash
 cd ~/Projects/ctrl-f-spatial-memory
-python3.12 -m venv .venv                  # or: uv venv --python 3.12 .venv
+python3.12 -m venv .venv            # or: uv venv --python 3.12 .venv
 .venv/bin/pip install -r backend/requirements.txt
 npm --prefix frontend install
 ```
 
-The YOLO weights (`yolo11n.pt`, about 5 MB) download automatically into `backend/models/` on first run. To download them ahead of time:
-
-```bash
-cd backend/models && ../../.venv/bin/python -c "from ultralytics import YOLO; YOLO('yolo11n.pt')"
-```
+The YOLO weights (`yolo11n.pt`, about 5 MB) download into `backend/models/` on first run.
 
 ## Run
 
-Terminal 1, backend (binds to `127.0.0.1:8000` only):
+Start the backend from **Terminal or iTerm**, not from an IDE or agent app. macOS grants camera access per app.
 
 ```bash
-cd backend && ../.venv/bin/python main.py
+cd ~/Projects/ctrl-f-spatial-memory/backend && ../.venv/bin/python main.py
 ```
-
-Terminal 2, frontend:
 
 ```bash
-npm --prefix frontend run dev
+npm --prefix ~/Projects/ctrl-f-spatial-memory/frontend run dev
 ```
 
-Open http://127.0.0.1:5173. Vite proxies `/api` to the backend.
+Open http://127.0.0.1:5173. For voice, use Chrome, Edge or Safari.
 
-### Webcam permission (macOS)
-
-macOS grants camera access per app, so the **terminal app** that starts the backend needs permission. The server opens the camera on a background thread, which **cannot show the permission prompt**, so first run:
+### Choosing the camera (macOS)
 
 ```bash
-cd backend && ../.venv/bin/python check_camera.py
+cd backend && ../.venv/bin/python check_camera.py 0     # triggers the permission prompt; try 1, 2…
 ```
 
-Allow the prompt, or turn it on under **System Settings → Privacy & Security → Camera** for Terminal, iTerm or VS Code. Then restart that terminal.
-
-### Camera configuration
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `CTRLF_CAMERA_INDEX` | `0` | Webcam index (try `1` for an external camera), or a video file path for testing |
-| `CTRLF_CAMERA_ENABLED` | `1` | `0` runs the API with no camera |
-| `CTRLF_CONFIDENCE` | `0.4` | Minimum detection confidence |
-| `CTRLF_INFERENCE_FPS` | `5` | Target inference rate |
-| `CTRLF_STABILITY_FRAMES` | `5` | Sightings in a row needed to accept a move |
-| `CTRLF_ABSENCE_SECONDS` | `2.0` | Time unseen before an object is marked not visible |
-| `CTRLF_DB_PATH` | `backend/data/ctrlf.db` | SQLite file |
-
-See [.env.example](.env.example). Variables are read from the environment, so set them inline, for example:
+With an iPhone nearby, Continuity Camera is often index 0 and the built-in camera index 1. Set `CTRLF_CAMERA_INDEX` to choose:
 
 ```bash
 cd backend && CTRLF_CAMERA_INDEX=1 ../.venv/bin/python main.py
 ```
 
-### Region configuration
+For Continuity Camera, keep the iPhone locked and still, with its **back** camera facing the room. The phone shows "Connected to …" but no preview; the picture only appears on the Mac. If the app warns about black frames, restart the backend.
 
-Edit [backend/regions.json](backend/regions.json) and restart the backend. Each region has:
+## Using it
 
-- `camera: [x0, y0, x1, y1]`: the area of the camera frame, normalized 0–1 from the top-left. By default, the frame is split into vertical thirds: Desk on the left, Dresser in the middle, Bed on the right.
-- `map: [x0, y0, x1, y1]`: where the region appears on the dashboard blueprint.
+- **List (home):** every item, with its latest photo, last-seen place, time and status. Tap one for the full photo with the item highlighted, the exact time, notes, and earlier photos.
+- **Map:** the same data drawn on a room sketch. Solid markers are in view now, dashed ones are last-seen, and amber ones were last seen before the camera moved. Positions are approximate.
+- **Voice:** press Voice. Keepsake asks "What are you looking for?", listens, answers from its stored memory ("I last saw your water bottle on the desk at 3:42 PM…") and opens the item's photo. Typing works too.
+- **Reposition:** press it *before* moving the camera. Monitoring pauses, so nothing counts as a move. Then:
+  1. Press **Finish Repositioning**. Keepsake waits for a steady view and takes a reference photo.
+  2. Drag the Desk, Dresser and Bed boxes over the furniture, and press **Save areas**.
+  3. Press **Resume monitoring**.
 
-Region outlines are drawn on the live camera preview, so you can line up your physical setup with them.
+  Old photos and locations are kept and marked "before the camera moved". When an item is seen again from the new view, it's **reconfirmed**: you get a fresh photo, but it isn't logged as a move. If the whole view shifts unexpectedly, Keepsake briefly stops updating and suggests Reposition.
+- **Privacy panel:** pause photo saving (locations still update), or clear all memories and photos.
 
-## Live demo
+## Configuration
 
-1. Start the backend and frontend. The header shows **Camera active**.
-2. Put a bottle in the left third of the frame (**Desk**). After about 1 s it appears on the map, and *"Bottle first seen on the Desk"* shows in Recent activity.
-3. Move it to the middle third (**Dresser**). After about 1 s the icon moves, and *"Bottle moved from Desk → Dresser"* is logged.
-4. Ask **"Where is my bottle?"** by typing it, or press the mic and speak (Chrome/Edge/Safari). The answer is *"I last saw your bottle on the dresser."* It is spoken aloud and the icon is highlighted.
-5. Take the bottle out of view. The icon becomes a dashed "last seen" marker.
-6. Ask again: *"I last saw your bottle on the dresser, but it's not currently visible."*
-7. Restart the backend. The memory is still there.
+All settings are optional environment variables, read at backend start. See [.env.example](.env.example).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CTRLF_CAMERA_INDEX` | `0` | Camera index, or a video file path for testing (video files loop) |
+| `CTRLF_CAMERA_ENABLED` | `1` | `0` runs the API with no camera |
+| `CTRLF_CONFIDENCE` | `0.4` | Minimum YOLO confidence |
+| `CTRLF_INFERENCE_FPS` | `5` | Detection rate |
+| `CTRLF_STABILITY_FRAMES` | `4` | Minimum settled frames before confirming |
+| `CTRLF_SETTLE_SECONDS` | `0.8` | How long an item must hold still |
+| `CTRLF_MOVE_THRESHOLD` | `0.06` | Same-area distance (fraction of frame) that counts as a move |
+| `CTRLF_ABSENCE_SECONDS` | `2.0` | Time unseen before an item is marked out of view |
+| `CTRLF_SNAPSHOT_RETENTION` | `20` | Photos kept per item |
+| `CTRLF_SNAPSHOT_COOLDOWN` | `3` | Seconds within which a same-spot photo counts as a duplicate |
+| `CTRLF_SNAPSHOT_DIR` | `backend/data/snapshots` | Where photos are stored (git-ignored) |
+| `CTRLF_DB_PATH` | `backend/data/ctrlf.db` | SQLite file (git-ignored) |
+| `CTRLF_REGIONS` | `backend/regions.json` | Area rectangles, edited by the Reposition flow |
 
 ## API
 
-| Method | Path | Description |
+| Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/health` | Server, camera status, fps, current detections |
-| GET | `/api/regions` | Configured regions |
-| GET | `/api/objects` | All remembered objects |
-| GET | `/api/objects/{id}` | One object by id (`bottle_01`) or name (`phone`) |
-| GET | `/api/events?limit=50` | Recent movement events |
-| POST | `/api/query` | `{"text": "where is my phone?"}` → `{found, answer, object}` |
-| DELETE | `/api/memory` | Clear all objects and events |
-| GET | `/api/camera` | MJPEG stream of the annotated live frame |
+| GET | `/api/health` | Camera status, mode, capture setting, live detections |
+| GET | `/api/catalog` | The eight items and their aliases |
+| GET | `/api/objects` | All eight items in one canonical shape, including the latest photo (used by List, Map and Voice) |
+| GET | `/api/objects/{id}` | One item, by id (`bottle_01`) or name (`phone`) |
+| GET | `/api/objects/{id}/snapshots` | Photo history |
+| GET | `/api/snapshots/{id}/image` | The photo (by id only, never by path) |
+| GET | `/api/events` | Movement history |
+| POST | `/api/query` | `{"text": "my water bottle"}` → `{found, answer, object}` |
+| GET/PUT | `/api/settings` | `{"capture_enabled": bool}` |
+| DELETE | `/api/memory` | Forget everything and delete all photos |
+| POST | `/api/reposition/{start,cancel,finish,resume}` | Reposition mode |
+| GET | `/api/calibration/reference` | Steady reference photo of the new view (kept in memory) |
+| GET/PUT | `/api/regions` | Read or save the area rectangles |
+| GET | `/api/camera` | Live annotated MJPEG preview |
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest          # backend: synthetic observations, no webcam needed
-npm --prefix frontend run build     # frontend type-check + build
+.venv/bin/python -m pytest
+npm --prefix frontend run build
 ```
 
-The tests cover region assignment, moves between regions, jitter rejection, low-confidence filtering, keeping the last-seen location after disappearance, track-ID re-association, persistence across database reopen, clearing memory, query parsing and fallbacks, and an API round-trip. All of these use **synthetic** detections; they don't exercise a real webcam.
+There are 40 backend tests, all using **synthetic** detections and frames. They cover:
 
-To test the real detector without a webcam, point `CTRLF_CAMERA_INDEX` at any video file. Test video files are looped.
+- the catalog and its aliases
+- first sightings, moves between areas and moves within an area
+- jitter and brief flicker, unrelated motion and passers-by, person occlusion
+- items leaving view (including mid-move) and missing detections
+- snapshot creation, duplicate suppression, retention, persistence and deletion
+- the capture toggle, query answers, and list/detail consistency
+- the full reposition flow, including preserving history and no false moves
+
+These tests check the logic, not real-world perception accuracy. See the live checklist below.
+
+### Live test checklist (real camera)
+
+1. **Placement:** put a bottle on the Desk area and wait about 1 s. The card shows a photo, "Desk", "In view now".
+2. **Move:** move it to another area, or more than about 1/16 of the frame within the Desk. A new photo appears and Recent activity logs the move.
+3. **Walk-by:** walk through the frame without touching anything. No new photos.
+4. **Disappearance:** take the bottle away. It keeps its last photo and shows "Out of view".
+5. **Voice:** press Voice and say "my water bottle". You hear the answer and the photo opens.
+6. **Reposition:** press Reposition, move the camera, Finish, adjust the areas, Save, Resume. There should be no new movement events, and old photos remain.
 
 ## Privacy
 
-- Frames are captured, run through inference, and annotated **in memory only**. The latest annotated JPEG is held in RAM for the preview stream. Nothing is written to disk or sent anywhere.
-- SQLite stores only object categories, normalized positions, regions, timestamps, confidences and movement events.
-- Ultralytics telemetry (`sync`) is turned off at startup. There are no cloud APIs or analytics.
-- The server listens on `127.0.0.1` only. Don't expose it to a network.
-- Raw frames still exist briefly in process memory while they're being processed.
-- Object metadata can itself reveal behavior patterns, such as when you're home or when you use your phone. Use **Clear memory** in the dashboard (or `DELETE /api/memory`) to erase it.
-- Voice: browser speech recognition may be processed by the browser vendor's cloud service. In Chrome, audio goes to Google. Typed queries never leave your machine.
+- Camera footage is processed locally. Keepsake saves selected object-memory photos, not a continuous video recording.
+- Photos are full frames, so they can show whatever else is in the room. They stay in `backend/data/snapshots/` (git-ignored) and are never uploaded.
+- Live frames exist only in memory: the preview stream, a ring buffer of about 2.5 seconds used to pick photo frames, and the calibration reference.
+- SQLite stores item names, areas, approximate positions, times, confidence and photo metadata. Even this metadata can reveal routines.
+- You can pause photo saving or clear everything from the Privacy panel.
+- The backend listens on 127.0.0.1 only. Ultralytics telemetry is turned off, and there are no cloud APIs or analytics.
+- Voice recognition runs in your browser. In Chrome, speech audio is processed by Google. Typed questions stay local.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| "Camera unavailable" / `not authorized to capture video` | Run `check_camera.py` and grant camera permission to your terminal (see above) |
-| Wrong camera | Set `CTRLF_CAMERA_INDEX=1` (or 2…) |
-| Camera pops up on your iPhone, then disappears | macOS made the iPhone (Continuity Camera) index 0. Use `CTRLF_CAMERA_INDEX=1` for the built-in FaceTime camera |
-| Works in Terminal but not when started from an IDE/agent app | macOS grants camera access per app. Start the backend from a terminal app that has permission |
-| Objects flicker between regions | Raise `CTRLF_STABILITY_FRAMES`, or move the object further from region borders |
-| Object not detected | Use good lighting and a clear view, try lowering `CTRLF_CONFIDENCE` to 0.3, and use a supported class |
-| Mic button disabled | The browser lacks the Web Speech API (e.g. Firefox). Type instead |
-| "Server offline" in the header | The backend isn't running on port 8000 |
-| Slow on CPU | Lower `CTRLF_INFERENCE_FPS` to 2–3 |
+| "Camera unavailable" | Start the backend from Terminal and run `check_camera.py` to grant permission |
+| Camera pops up on your iPhone, then disappears | Pick the camera with `CTRLF_CAMERA_INDEX` (iPhone is often 0, built-in camera 1) |
+| "The camera is sending black frames" | Uncover the lens or restart the backend (Continuity Camera sometimes connects black) |
+| "The camera view changed a lot" | If you moved the camera, press Reposition and recalibrate |
+| No photo after moving an item | Let go and wait about 1 s. Photos are taken only once the item holds still and your hand is clear |
+| Item not detected | Improve the lighting or move it closer, or lower `CTRLF_CONFIDENCE` to 0.3. Small items (mouse, remote) are harder |
+| Voice button says unsupported | Use Chrome, Edge or Safari, or type instead |
+
+## Not built (stretch goals)
+
+- **Hand-object interaction (MediaPipe):** not implemented. Keepsake infers interaction only from an item's own movement, and never claims an item was touched if it didn't move.
+- **3D room view:** not implemented. YOLO provides no room geometry or camera pose. A real 3D room would need something like an Apple RoomPlan export from a LiDAR iPhone, converted to a Three.js scene. Nothing in the app fakes a 3D scan.

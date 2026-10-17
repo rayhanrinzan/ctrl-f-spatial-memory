@@ -44,3 +44,36 @@ def region_for_point(x: float, y: float, regions: list[Region]) -> str | None:
         if r.contains(x, y):
             return r.name
     return None
+
+
+def validate_regions(items: list[dict]) -> list[Region]:
+    """Build regions from API/JSON dicts, rejecting malformed rectangles."""
+    if not 1 <= len(items) <= 8:
+        raise ValueError("Provide between 1 and 8 regions")
+    out, names = [], set()
+    for it in items:
+        name = str(it.get("name", "")).strip()
+        if not name or len(name) > 32 or name.lower() in names:
+            raise ValueError(f"Bad or duplicate region name: {name!r}")
+        names.add(name.lower())
+        x0, y0, x1, y1 = (float(v) for v in it["camera"])
+        mx0, my0, mx1, my1 = (float(v) for v in it.get("map", (0, 0, 1, 1)))
+        for v in (x0, y0, x1, y1, mx0, my0, mx1, my1):
+            if not 0.0 <= v <= 1.0:
+                raise ValueError("Coordinates must be between 0 and 1")
+        if x1 - x0 < 0.02 or y1 - y0 < 0.02 or mx1 <= mx0 or my1 <= my0:
+            raise ValueError(f"Region {name} is too small or inverted")
+        out.append(Region(name, x0, y0, x1, y1, map=(mx0, my0, mx1, my1)))
+    return out
+
+
+def save_regions(regions: list[Region], path: str | os.PathLike | None = None) -> None:
+    path = Path(path or os.getenv("CTRLF_REGIONS", DEFAULT_REGIONS_PATH))
+    rows = [json.dumps({"name": r.name, "camera": [round(v, 4) for v in (r.x0, r.y0, r.x1, r.y1)],
+                        "map": [round(v, 4) for v in r.map]}) for r in regions]
+    text = ('{\n  "_comment": "camera: [x0, y0, x1, y1] normalized to the camera frame. '
+            'map: [x0, y0, x1, y1] normalized to the dashboard blueprint.",\n  "regions": [\n    '
+            + ",\n    ".join(rows) + "\n  ]\n}\n")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)

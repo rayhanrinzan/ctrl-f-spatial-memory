@@ -1,5 +1,5 @@
-// Browser speech helpers. Recognition is push-to-talk: call listen() from a button.
-// A future wake-word listener can call the same listen() when it hears the trigger phrase.
+// Browser speech helpers (Web Speech API). Recognition is started explicitly by the Voice button;
+// a future wake-word listener can start the same conversation by calling listenOnce().
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const Recognition: any =
@@ -10,40 +10,84 @@ const Recognition: any =
 export const speechInputSupported = Boolean(Recognition)
 export const speechOutputSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
 
-export interface Listener {
-  stop: () => void
-}
-
-export function listen(handlers: {
-  onResult: (text: string) => void
-  onInterim?: (text: string) => void
-  onEnd: () => void
-  onError: (message: string) => void
-}): Listener | null {
-  if (!Recognition) return null
-  const rec = new Recognition()
-  rec.lang = 'en-US'
-  rec.interimResults = true
-  rec.maxAlternatives = 1
-  rec.onresult = (e: any) => {
-    const result = e.results[e.results.length - 1]
-    const text = result[0].transcript as string
-    if (result.isFinal) handlers.onResult(text)
-    else handlers.onInterim?.(text)
+export class VoiceError extends Error {
+  code: 'no-speech' | 'not-allowed' | 'unsupported' | 'aborted' | 'other'
+  constructor(code: VoiceError['code'], message: string) {
+    super(message)
+    this.code = code
   }
-  rec.onerror = (e: any) =>
-    handlers.onError(
-      e.error === 'not-allowed' ? 'Microphone access was blocked.' : `Voice input error: ${e.error}`,
-    )
-  rec.onend = handlers.onEnd
-  rec.start()
-  return { stop: () => rec.stop() }
 }
 
-export function speak(text: string) {
-  if (!speechOutputSupported) return
-  window.speechSynthesis.cancel()
-  const u = new SpeechSynthesisUtterance(text)
-  u.rate = 1.02
-  window.speechSynthesis.speak(u)
+let active: any = null
+
+/** Listen for one utterance. Resolves with the final transcript. */
+export function listenOnce(onInterim?: (text: string) => void): Promise<string> {
+  if (!Recognition) {
+    return Promise.reject(new VoiceError('unsupported', "Voice input isn't available in this browser."))
+  }
+  return new Promise((resolve, reject) => {
+    const rec = new Recognition()
+    active = rec
+    rec.lang = 'en-US'
+    rec.interimResults = true
+    rec.maxAlternatives = 1
+    let finalText = ''
+    let failed: VoiceError | null = null
+    rec.onresult = (e: any) => {
+      const r = e.results[e.results.length - 1]
+      if (r.isFinal) finalText = r[0].transcript
+      else onInterim?.(r[0].transcript)
+    }
+    rec.onerror = (e: any) => {
+      const code = e.error === 'no-speech' ? 'no-speech'
+        : e.error === 'not-allowed' || e.error === 'service-not-allowed' ? 'not-allowed'
+          : e.error === 'aborted' ? 'aborted' : 'other'
+      failed = new VoiceError(code, code === 'not-allowed'
+        ? 'Microphone access is blocked. Allow it in your browser settings, or type instead.'
+        : code === 'no-speech' ? "I didn't hear anything." : `Voice input error: ${e.error}`)
+    }
+    rec.onend = () => {
+      active = null
+      if (failed) reject(failed)
+      else if (finalText.trim()) resolve(finalText.trim())
+      else reject(new VoiceError('no-speech', "I didn't hear anything."))
+    }
+    try {
+      rec.start()
+    } catch {
+      active = null
+      reject(new VoiceError('other', "Couldn't start the microphone."))
+    }
+  })
+}
+
+/** Speak and resolve when finished (or after a safety timeout if the browser never reports the end). */
+export function speak(text: string): Promise<void> {
+  if (!speechOutputSupported) return Promise.resolve()
+  return new Promise((resolve) => {
+    window.speechSynthesis.cancel()
+    const u = new SpeechSynthesisUtterance(text)
+    u.rate = 0.98
+    let done = false
+    const finish = () => {
+      if (!done) {
+        done = true
+        resolve()
+      }
+    }
+    u.onend = finish
+    u.onerror = finish
+    setTimeout(finish, 1500 + text.length * 90)
+    window.speechSynthesis.speak(u)
+  })
+}
+
+export function stopVoice() {
+  try {
+    active?.abort()
+  } catch {
+    /* already stopped */
+  }
+  active = null
+  if (speechOutputSupported) window.speechSynthesis.cancel()
 }

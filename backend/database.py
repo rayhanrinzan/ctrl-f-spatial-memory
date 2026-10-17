@@ -1,4 +1,7 @@
-"""SQLite persistence for object memories and movement events. Never stores frames."""
+"""SQLite persistence for object memories, movement events, snapshot metadata and settings.
+
+Snapshot *images* live on disk (see snapshots.py); SQLite stores only their metadata.
+"""
 from __future__ import annotations
 
 import sqlite3
@@ -26,10 +29,34 @@ CREATE TABLE IF NOT EXISTS events (
     to_region   TEXT NOT NULL,
     timestamp   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    object_id   TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    region      TEXT,
+    x0 REAL, y0 REAL, x1 REAL, y1 REAL,
+    confidence  REAL,
+    filename    TEXT NOT NULL UNIQUE,
+    view_id     TEXT
+);
+CREATE INDEX IF NOT EXISTS snapshots_object ON snapshots (object_id, id);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
-OBJECT_FIELDS = ("object_id", "category", "name", "region", "x", "y",
-                 "last_seen", "visible", "confidence", "track_id")
+# Columns added after the first release; applied to existing databases on open.
+MIGRATIONS = {
+    "objects": {"view_id": "TEXT", "lost_while_moving": "INTEGER NOT NULL DEFAULT 0"},
+    "events": {"event_type": "TEXT NOT NULL DEFAULT 'moved'", "view_id": "TEXT"},
+}
+
+OBJECT_FIELDS = ("object_id", "category", "name", "region", "x", "y", "last_seen", "visible",
+                 "confidence", "track_id", "view_id", "lost_while_moving")
+SNAPSHOT_FIELDS = ("object_id", "event_type", "timestamp", "region", "x0", "y0", "x1", "y1",
+                   "confidence", "filename", "view_id")
 
 
 def _obj(row: sqlite3.Row | None) -> dict | None:
@@ -37,6 +64,7 @@ def _obj(row: sqlite3.Row | None) -> dict | None:
         return None
     d = dict(row)
     d["visible"] = bool(d["visible"])
+    d["lost_while_moving"] = bool(d.get("lost_while_moving"))
     return d
 
 
@@ -49,13 +77,23 @@ class Database:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
 
+    def _migrate(self) -> None:
+        for table, cols in MIGRATIONS.items():
+            have = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            for col, decl in cols.items():
+                if col not in have:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+    # ---- objects ----
     def upsert_object(self, obj: dict) -> None:
         cols = ", ".join(OBJECT_FIELDS)
         marks = ", ".join("?" for _ in OBJECT_FIELDS)
         updates = ", ".join(f"{f}=excluded.{f}" for f in OBJECT_FIELDS if f != "object_id")
-        values = [int(obj[f]) if f == "visible" else obj.get(f) for f in OBJECT_FIELDS]
+        values = [int(bool(obj.get(f))) if f in ("visible", "lost_while_moving") else obj.get(f)
+                  for f in OBJECT_FIELDS]
         with self._lock:
             self._conn.execute(
                 f"INSERT INTO objects ({cols}) VALUES ({marks}) "
@@ -79,12 +117,14 @@ class Database:
                 "SELECT * FROM objects WHERE category = ?", (category,)).fetchone()
         return _obj(row)
 
-    def add_event(self, object_id: str, name: str, from_region: str | None,
-                  to_region: str, timestamp: str) -> None:
+    # ---- events ----
+    def add_event(self, object_id: str, name: str, from_region: str | None, to_region: str,
+                  timestamp: str, event_type: str = "moved", view_id: str | None = None) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT INTO events (object_id, name, from_region, to_region, timestamp) "
-                "VALUES (?, ?, ?, ?, ?)", (object_id, name, from_region, to_region, timestamp))
+                "INSERT INTO events (object_id, name, from_region, to_region, timestamp, "
+                "event_type, view_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (object_id, name, from_region, to_region, timestamp, event_type, view_id))
             self._conn.commit()
 
     def get_events(self, limit: int = 50) -> list[dict]:
@@ -93,10 +133,68 @@ class Database:
                 "SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
 
-    def clear(self) -> None:
+    # ---- snapshots ----
+    def add_snapshot(self, snap: dict) -> int:
+        cols = ", ".join(SNAPSHOT_FIELDS)
+        marks = ", ".join("?" for _ in SNAPSHOT_FIELDS)
         with self._lock:
-            self._conn.execute("DELETE FROM objects")
-            self._conn.execute("DELETE FROM events")
+            cur = self._conn.execute(f"INSERT INTO snapshots ({cols}) VALUES ({marks})",
+                                     [snap.get(f) for f in SNAPSHOT_FIELDS])
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_snapshot(self, snapshot_id: int) -> dict | None:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM snapshots WHERE id = ?",
+                                     (snapshot_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_snapshots(self, object_id: str, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM snapshots WHERE object_id = ? ORDER BY id DESC LIMIT ?",
+                (object_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def latest_snapshots(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.* FROM snapshots s JOIN (SELECT object_id, MAX(id) AS id FROM snapshots "
+                "GROUP BY object_id) m ON s.id = m.id").fetchall()
+        return {r["object_id"]: dict(r) for r in rows}
+
+    def prune_snapshots(self, object_id: str, keep: int) -> list[str]:
+        """Delete all but the newest `keep` snapshot rows for an object; return their filenames."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, filename FROM snapshots WHERE object_id = ? ORDER BY id DESC "
+                "LIMIT -1 OFFSET ?", (object_id, keep)).fetchall()
+            self._conn.executemany("DELETE FROM snapshots WHERE id = ?", [(r["id"],) for r in rows])
+            self._conn.commit()
+        return [r["filename"] for r in rows]
+
+    def all_snapshot_files(self) -> list[str]:
+        with self._lock:
+            return [r["filename"] for r in self._conn.execute("SELECT filename FROM snapshots")]
+
+    # ---- settings ----
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            self._conn.commit()
+
+    # ---- lifecycle ----
+    def clear(self) -> None:
+        """Forget objects, events and snapshot rows (settings such as the camera view are kept)."""
+        with self._lock:
+            for table in ("objects", "events", "snapshots"):
+                self._conn.execute(f"DELETE FROM {table}")
             self._conn.commit()
 
     def close(self) -> None:

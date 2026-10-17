@@ -1,31 +1,35 @@
-"""Spatial memory: turns per-frame detections into stable last-known locations, and answers lookups."""
+"""Spatial memory: turns per-frame detections into settled last-known locations, and answers lookups.
+
+Each tracked category runs a small state machine, advanced once per processed frame (never sleeps):
+
+    STABLE ──displaced──► POSSIBLE_CHANGE ──jump──► MOVING ──holds still──► SETTLING ──► CONFIRMED
+       ▲                                                                                   │
+       └──────────────────────────── commit location, request snapshot ────────────────────┘
+
+"Displaced" means a different region than the stored one, or farther than `move_threshold`
+(normalized image units) from the stored position. A displaced object must stay within `jitter`
+of itself for `settle_seconds` and `stability` frames, with little local motion, to be confirmed.
+"""
 from __future__ import annotations
 
+import math
 import re
 import threading
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from catalog import ALIASES, BY_CATEGORY, CATALOG, SUPPORTED  # noqa: F401  (re-exported)
 from database import Database
 from spatial import Region, region_for_point
 
-# YOLO (COCO) category -> words people use for it. One instance per category in the MVP.
-ALIASES: dict[str, list[str]] = {
-    "bottle": ["bottle", "water bottle", "drink"],
-    "cup": ["cup", "mug", "coffee"],
-    "cell phone": ["cell phone", "phone", "mobile", "iphone", "smartphone", "cellphone"],
-    "book": ["book", "notebook", "novel"],
-    "backpack": ["backpack", "bag", "rucksack", "bookbag"],
-    "remote": ["remote", "tv remote", "controller"],
-    "scissors": ["scissors"],
-    "mouse": ["mouse", "computer mouse"],
-    "laptop": ["laptop", "macbook", "computer", "notebook computer"],
-}
-SUPPORTED = list(ALIASES)
+UNMARKED = "Elsewhere"  # region name for objects outside every configured region
+
+STABLE, POSSIBLE_CHANGE, MOVING, SETTLING = "STABLE", "POSSIBLE_CHANGE", "MOVING", "SETTLING"
 
 
 def display_name(category: str) -> str:
-    return category.title()
+    return BY_CATEGORY[category]["name"] if category in BY_CATEGORY else category.title()
 
 
 def object_id_for(category: str) -> str:
@@ -36,6 +40,10 @@ def now_iso(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
 
 
+def new_view_id() -> str:
+    return "view-" + uuid.uuid4().hex[:8]
+
+
 @dataclass
 class Observation:
     category: str
@@ -44,91 +52,213 @@ class Observation:
     y: float
     track_id: int | None = None
     bbox: tuple[float, float, float, float] | None = None  # normalized x0,y0,x1,y1
+    motion: float = 0.0  # fraction of changed pixels around the object this frame (0..1)
+
+
+@dataclass
+class _Sample:
+    t: datetime
+    x: float
+    y: float
+    region: str
+    confidence: float
+    bbox: tuple[float, float, float, float] | None
+    frame_id: int | None
+    occluded: bool
+    motion: float
+
+
+@dataclass
+class _Track:
+    state: str = STABLE
+    samples: list[_Sample] = field(default_factory=list)
+    last_obs: datetime | None = None
+
+
+def _covered(box: tuple | None, by: tuple | None) -> float:
+    """Fraction of `box` area covered by `by`."""
+    if not box or not by:
+        return 0.0
+    ix = max(0.0, min(box[2], by[2]) - max(box[0], by[0]))
+    iy = max(0.0, min(box[3], by[3]) - max(box[1], by[1]))
+    area = max(1e-9, (box[2] - box[0]) * (box[3] - box[1]))
+    return ix * iy / area
 
 
 class SpatialMemory:
-    """Updates a stored region only after `stability` consecutive sightings in a new region."""
-
-    def __init__(self, db: Database, regions: list[Region], stability: int = 5,
-                 min_confidence: float = 0.4, absence_seconds: float = 2.0):
+    def __init__(self, db: Database, regions: list[Region], stability: int = 4,
+                 min_confidence: float = 0.4, absence_seconds: float = 2.0,
+                 move_threshold: float = 0.06, jitter: float = 0.025,
+                 settle_seconds: float = 0.8, motion_threshold: float = 0.08):
         self.db = db
         self.regions = regions
         self.stability = stability
         self.min_confidence = min_confidence
         self.absence = timedelta(seconds=absence_seconds)
-        self._candidates: dict[str, tuple[str, int]] = {}  # category -> (region, count)
+        self.move_threshold = move_threshold
+        self.jitter = jitter
+        self.settle = timedelta(seconds=settle_seconds)
+        self.motion_threshold = motion_threshold
+        self.paused = False
+        self._suspended_until: datetime | None = None
+        self._tracks: dict[str, _Track] = {}
         self._lock = threading.Lock()
+        self.view_id = db.get_setting("view_id") or new_view_id()
+        db.set_setting("view_id", self.view_id)
+        for rec in db.get_objects():  # records from before view tracking belong to this view
+            if rec.get("view_id") is None:
+                rec["view_id"] = self.view_id
+                db.upsert_object(rec)
 
-    def observe(self, observations: list[Observation], now: datetime | None = None) -> list[dict]:
-        """Process one frame's detections. Returns movement events created."""
+    # ---------- per-frame processing ----------
+    def observe(self, observations: list[Observation], now: datetime | None = None,
+                frame_id: int | None = None) -> list[dict]:
+        """Process one frame's detections. Returns confirmed events (each may warrant a snapshot)."""
         now = now or datetime.now(timezone.utc)
-        ts = now_iso(now)
-        events: list[dict] = []
-        # One instance per category: keep the most confident detection of each.
-        best: dict[str, Observation] = {}
-        for o in observations:
-            if o.category in ALIASES and o.confidence >= self.min_confidence:
-                if o.category not in best or o.confidence > best[o.category].confidence:
-                    best[o.category] = o
-
         with self._lock:
+            if self.paused:
+                return []
+            if self._suspended_until and now < self._suspended_until:
+                for tr in self._tracks.values():
+                    tr.samples.clear()
+                    tr.state = STABLE
+                return []
+            people = [o.bbox for o in observations if o.category == "person"]
+            # One instance per category: keep the most confident detection of each.
+            best: dict[str, Observation] = {}
+            for o in observations:
+                if o.category in ALIASES and o.confidence >= self.min_confidence:
+                    if o.category not in best or o.confidence > best[o.category].confidence:
+                        best[o.category] = o
+            events = []
             for category, o in best.items():
-                ev = self._update(category, o, ts)
+                occluded = any(_covered(o.bbox, p) > 0.6 for p in people)
+                ev = self._update(category, o, now, frame_id, occluded)
                 if ev:
                     events.append(ev)
             self._mark_absent(set(best), now)
-        return events
+            return events
 
-    def _update(self, category: str, o: Observation, ts: str) -> dict | None:
-        region = region_for_point(o.x, o.y, self.regions)
+    def _update(self, category: str, o: Observation, now: datetime, frame_id: int | None,
+                occluded: bool) -> dict | None:
+        ts = now_iso(now)
+        region = region_for_point(o.x, o.y, self.regions) or UNMARKED
         rec = self.db.get_by_category(category)
+        tr = self._tracks.setdefault(category, _Track())
+        tr.last_obs = now
+        reacquire = rec is not None and rec.get("view_id") != self.view_id
+
         if rec:
-            rec.update(last_seen=ts, visible=True, confidence=round(o.confidence, 3),
-                       track_id=o.track_id)
+            rec.update(visible=True, confidence=round(o.confidence, 3), track_id=o.track_id)
+        if rec and not reacquire:
+            dist = math.hypot(o.x - (rec["x"] or 0), o.y - (rec["y"] or 0))
+            displaced = region != rec["region"] or dist > self.move_threshold
+        else:
+            displaced = True  # first sighting, or first sighting in a new camera view
 
-        if region is None:  # seen, but outside every region: refresh sighting only
-            if rec:
-                self.db.upsert_object(rec)
-            return None
-
-        if rec and rec["region"] == region:
-            self._candidates.pop(category, None)
-            rec.update(x=round(o.x, 4), y=round(o.y, 4))
+        if not displaced:  # still where we remember it
+            tr.state, tr.samples = STABLE, []
+            rec.update(last_seen=ts, lost_while_moving=False)
             self.db.upsert_object(rec)
             return None
 
-        cand_region, count = self._candidates.get(category, (None, 0))
-        count = count + 1 if cand_region == region else 1
-        self._candidates[category] = (region, count)
-        if count < self.stability:
-            if rec:
-                self.db.upsert_object(rec)
-            return None
+        s = _Sample(now, o.x, o.y, region, o.confidence, o.bbox, frame_id, occluded, o.motion)
+        last = tr.samples[-1] if tr.samples else None
+        if last and (math.hypot(s.x - last.x, s.y - last.y) > self.jitter or s.region != last.region):
+            tr.state, tr.samples = MOVING, [s]  # still on the move: restart the settle window
+        else:
+            tr.samples.append(s)
+            tr.samples = tr.samples[-60:]
+            if tr.state == STABLE:
+                tr.state = POSSIBLE_CHANGE
+            elif len(tr.samples) >= 2:
+                tr.state = SETTLING
+        if rec:
+            self.db.upsert_object(rec)  # visibility/confidence only; location waits for confirmation
 
-        # Stable in a new region: commit the move.
-        self._candidates.pop(category, None)
+        settled = (len(tr.samples) >= self.stability
+                   and now - tr.samples[0].t >= self.settle
+                   and s.motion < self.motion_threshold)
+        if not settled:
+            return None
+        return self._confirm(category, rec, tr, ts, reacquire)
+
+    def _confirm(self, category: str, rec: dict | None, tr: _Track, ts: str,
+                 reacquire: bool) -> dict:
+        cur = tr.samples[-1]
+        # Photo frame: the clearest (not covered by a person, most confident) settled frame.
+        best = max(tr.samples, key=lambda s: (not s.occluded, s.confidence, s.t))
+        if rec is None:
+            event_type = "first_seen"
+        elif reacquire:
+            event_type = "reconfirmed"
+        elif cur.region != rec["region"]:
+            event_type = "moved"
+        else:
+            event_type = "moved_within"
         from_region = rec["region"] if rec else None
-        rec = rec or {
-            "object_id": object_id_for(category), "category": category,
-            "name": display_name(category), "last_seen": ts, "visible": True,
-            "confidence": round(o.confidence, 3), "track_id": o.track_id,
-        }
-        rec.update(region=region, x=round(o.x, 4), y=round(o.y, 4))
+        rec = rec or {"object_id": object_id_for(category), "category": category,
+                      "name": display_name(category), "visible": True,
+                      "confidence": round(cur.confidence, 3)}
+        rec.update(region=cur.region, x=round(cur.x, 4), y=round(cur.y, 4), last_seen=ts,
+                   view_id=self.view_id, lost_while_moving=False, visible=True)
         self.db.upsert_object(rec)
-        self.db.add_event(rec["object_id"], rec["name"], from_region, region, ts)
-        return {"object_id": rec["object_id"], "name": rec["name"],
-                "from_region": from_region, "to_region": region, "timestamp": ts}
+        if event_type != "reconfirmed":  # re-finding an object from a new viewpoint is not a move
+            self.db.add_event(rec["object_id"], rec["name"], from_region, cur.region, ts,
+                              event_type=event_type, view_id=self.view_id)
+        tr.state, tr.samples = STABLE, []
+        return {"object_id": rec["object_id"], "name": rec["name"], "category": category,
+                "event_type": event_type, "from_region": from_region, "to_region": cur.region,
+                "region": cur.region, "timestamp": ts, "bbox": best.bbox,
+                "confidence": round(best.confidence, 3), "frame_id": best.frame_id,
+                "frame_time": now_iso(best.t),
+                "occluded": best.occluded, "view_id": self.view_id}
 
     def _mark_absent(self, seen: set[str], now: datetime) -> None:
+        lost_moving: set[str] = set()
+        for category, tr in self._tracks.items():
+            if category not in seen and tr.last_obs and now - tr.last_obs >= self.absence:
+                if tr.samples:  # left view mid-move: drop the unconfirmed candidate
+                    lost_moving.add(category)
+                tr.state, tr.samples = STABLE, []
         for rec in self.db.get_objects():
-            if rec["visible"] and rec["category"] not in seen:
-                if now - datetime.fromisoformat(rec["last_seen"]) >= self.absence:
-                    rec["visible"] = False
-                    self.db.upsert_object(rec)
+            if not rec["visible"] or rec["category"] in seen:
+                continue
+            tr = self._tracks.get(rec["category"])
+            last = tr.last_obs if tr and tr.last_obs else datetime.fromisoformat(rec["last_seen"])
+            if now - last >= self.absence:
+                rec["visible"] = False
+                rec["lost_while_moving"] = rec["category"] in lost_moving
+                self.db.upsert_object(rec)
+
+    # ---------- modes ----------
+    def states(self) -> dict[str, str]:
+        with self._lock:
+            return {c: t.state for c, t in self._tracks.items()}
+
+    def pause(self) -> None:
+        with self._lock:
+            self.paused = True
+            self._tracks.clear()
+
+    def resume(self, new_view: bool = False) -> None:
+        """Resume monitoring. With new_view, older memories become 'awaiting reconfirmation'."""
+        with self._lock:
+            self._tracks.clear()
+            self._suspended_until = None
+            if new_view:
+                self.view_id = new_view_id()
+                self.db.set_setting("view_id", self.view_id)
+            self.paused = False
+
+    def suspend(self, seconds: float, now: datetime | None = None) -> None:
+        """Ignore detections briefly (e.g. the whole camera view shifted)."""
+        with self._lock:
+            self._suspended_until = (now or datetime.now(timezone.utc)) + timedelta(seconds=seconds)
 
     def reset(self) -> None:
         with self._lock:
-            self._candidates.clear()
+            self._tracks.clear()
             self.db.clear()
 
 
@@ -145,19 +275,44 @@ def parse_query(text: str) -> tuple[str, str] | None:
     return cat, alias
 
 
-def answer_query(text: str, db: Database) -> dict:
+def spoken_time(iso: str, now: datetime | None = None) -> str:
+    t = datetime.fromisoformat(iso).astimezone()
+    clock = t.strftime("%I:%M %p").lstrip("0")
+    today = (now or datetime.now(timezone.utc)).astimezone().date()
+    if t.date() == today:
+        return f"at {clock}"
+    if (today - t.date()).days == 1:
+        return f"yesterday at {clock}"
+    return f"on {t.strftime('%b')} {t.day} at {clock}"
+
+
+def place_phrase(region: str) -> str:
+    return "somewhere outside the marked areas" if region == UNMARKED else f"on the {region.lower()}"
+
+
+def answer_query(text: str, db: Database, view_id: str | None = None) -> dict:
     parsed = parse_query(text)
     if not parsed:
-        names = ", ".join(SUPPORTED[:-1]) + f", and {SUPPORTED[-1]}"
-        return {"found": False, "object": None,
-                "answer": f"Sorry, I'm not sure which object you mean. I can look for a {names}."}
-    category, word = parsed
+        names = [c["name"].lower() for c in CATALOG]
+        listing = ", ".join(names[:-1]) + f", or {names[-1]}"
+        return {"found": False, "object": None, "snapshot": None, "category": None,
+                "answer": f"Sorry, I didn't catch which item you mean. "
+                          f"I can look for your {listing}."}
+    category, _ = parsed
+    noun = display_name(category).lower()
     rec = db.get_by_category(category)
     if not rec or not rec.get("region"):
-        return {"found": False, "object": None, "answer": f"I haven't seen your {word} yet."}
-    where = f"on the {rec['region'].lower()}"
-    if rec["visible"]:
-        answer = f"I last saw your {word} {where}."
+        return {"found": False, "object": None, "snapshot": None, "category": category,
+                "answer": f"I haven't seen your {noun} yet."}
+    snaps = db.get_snapshots(rec["object_id"], limit=1)
+    answer = f"I last saw your {noun} {place_phrase(rec['region'])} {spoken_time(rec['last_seen'])}"
+    if view_id and rec.get("view_id") and rec["view_id"] != view_id:
+        answer += ", before the camera was repositioned. I haven't spotted it since."
+    elif rec["visible"]:
+        answer += ". It's in view right now."
+    elif rec.get("lost_while_moving"):
+        answer += ". It looked like it was being moved when it left the camera's view."
     else:
-        answer = f"I last saw your {word} {where}, but it's not currently visible."
-    return {"found": True, "object": rec, "answer": answer}
+        answer += ". It's out of view now, so it may have moved since."
+    return {"found": True, "object": rec, "snapshot": snaps[0] if snaps else None,
+            "category": category, "answer": answer}

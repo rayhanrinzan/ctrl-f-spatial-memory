@@ -1,49 +1,51 @@
-# CLAUDE.md — Ctrl+F
+# CLAUDE.md — Keepsake
 
 ## Concept
-A local spatial memory. A stationary webcam and YOLO detect everyday objects, assign each one to a named room region, and remember its **last observed location**. Users ask "Where is my phone?" (text or voice) and get the answer, plus a highlight on a 2D room map. MVP: one webcam, three regions, one instance per object category.
+Keepsake (repo: ctrl-f-spatial-memory) is a local spatial-memory assistant for HackHarvard 2026. One camera, pretrained YOLO11n and ByteTrack recognize eight items. When an item settles in a new place, Keepsake saves its location **and a photo**. Users browse a List (default) or a Map, or press Voice ("What are you looking for?") to hear where an item was last seen and see its photo. Reposition mode lets the camera move without false movement history.
 
 ## Architecture
-- `backend/vision.py`: `VisionWorker` thread. OpenCV capture → `model.track(..., tracker="bytetrack.yaml")` → `Observation`s → `SpatialMemory.observe()`. Keeps the latest annotated JPEG in RAM for `/api/camera` (MJPEG). Never writes frames.
-- `backend/spatial.py`: `Region` (normalized camera rect + map rect), `load_regions()` from `regions.json`, `region_for_point()`.
-- `backend/memory.py`: `SpatialMemory` (stability filter, one record per category, marks objects not-visible after the absence timeout, logs events), `ALIASES`, `parse_query()`, `answer_query()` (deterministic, never invents locations).
-- `backend/database.py`: SQLite `objects` and `events` tables, parameterized queries, thread lock.
-- `backend/main.py`: FastAPI app and endpoints. Config comes from `CTRLF_*` env vars. Binds to 127.0.0.1.
-- `frontend/src`: React + Vite + TS + Tailwind v4. `App.tsx` polls `/api/health|objects|events` every 1 s. Components: `RoomMap` (positioned HTML blueprint), `SearchPanel` (text plus push-to-talk), `CameraPanel` (MJPEG `<img>`), `ActivityFeed`. Libraries: `lib/api.ts`, `lib/voice.ts` (Web Speech; `listen()` is the hook for a future wake word), `lib/format.ts` (icons, times).
-
-## Stack
-Python 3.12 venv at `.venv/` · ultralytics 8.4 (YOLO11n weights in `backend/models/`, gitignored) · OpenCV · FastAPI · SQLite · React 19 · Vite 8 · Tailwind 4 · lucide-react.
+- `backend/catalog.py`: the eight items (category = COCO class, display name, aliases, icon). This is the single source of truth.
+- `backend/memory.py`: `SpatialMemory.observe(obs, now, frame_id)` runs a per-category state machine (STABLE → POSSIBLE_CHANGE → MOVING → SETTLING → confirm). It returns confirmed events: `first_seen`, `moved`, `moved_within` or `reconfirmed`, with the best frame id and bbox. It also handles pause/resume (with a new view id), suspend (whole-camera shift) and lost-while-moving. `answer_query()` gives grounded, deterministic answers.
+- `backend/snapshots.py`: `SnapshotStore.submit(event, frame)` queues a JPEG write on a background thread, with cooldown dedupe, per-item retention, safe filename checks and `clear()`. The capture toggle is stored in the settings table.
+- `backend/vision.py`: `VisionWorker` thread. Capture → resize (1280 for photos, 640 for inference) → `MotionDetector` (frame differencing, global and per bbox) → YOLO track (catalog classes + person, for occlusion) → `memory.observe` → `snapshots.submit` with the frame from the ring buffer. It also produces the MJPEG preview, the black-frame and camera-shift warnings, and resets the tracker on reposition.
+- `backend/modes.py`: `ModeController` (MONITORING → REPOSITIONING → CALIBRATING → READY_TO_RESUME). It captures a reference JPEG once the view is steady.
+- `backend/database.py`: SQLite tables objects, events, snapshots (metadata only) and settings, with an in-place column migration.
+- `backend/spatial.py`: `Region`, `load_regions`, `validate_regions`, `save_regions` (`regions.json`).
+- `backend/main.py`: FastAPI. `object_view()` builds the canonical object shape that every UI uses. Config comes from `CTRLF_*` env vars. Binds to 127.0.0.1.
+- `frontend/src`: React 19, Vite, Tailwind 4 (theme tokens in `index.css`), lucide. `App.tsx` polls health/objects/events every 1.5 s.
+  - Components: `ObjectList`, `ObjectDetail` (dialog with photo history), `SnapshotPhoto` (bbox overlay), `RoomMap`, `SearchPanel` (voice conversation state machine plus typed input), `CameraPanel`/`LiveFeed`, `RepositionFlow` (with `RegionEditor`), `ActivityFeed`, `PrivacyPanel`.
+  - `lib/voice.ts`: `speak()` resolves when speech ends; `listenOnce()` is the hook for a future wake word.
 
 ## Run
 ```bash
-cd backend && ../.venv/bin/python main.py      # API on 127.0.0.1:8000
-npm --prefix frontend run dev                   # UI on 127.0.0.1:5173 (proxies /api)
-cd backend && ../.venv/bin/python check_camera.py   # macOS camera permission prompt
+cd backend && ../.venv/bin/python main.py          # from Terminal (camera permission is per app)
+npm --prefix frontend run dev                       # http://127.0.0.1:5173
+cd backend && ../.venv/bin/python check_camera.py 1 # pick/permit a camera index
 ```
-`CTRLF_CAMERA_INDEX=/path/video.mp4` runs real detection on a looping video file. `CTRLF_CAMERA_ENABLED=0` runs with no camera.
+Agent sessions can't get camera permission directly. Launch the backend in Terminal.app, e.g. `open -a Terminal some.command`. To stop it, kill only the listener (`lsof -ti tcp:8000 -sTCP:LISTEN`); killing all users of port 8000 also kills the Vite proxy.
 
 ## Test
 ```bash
-.venv/bin/python -m pytest        # pytest.ini sets pythonpath=backend
+.venv/bin/python -m pytest        # 40 tests, synthetic detections; pytest.ini sets pythonpath=backend
 npm --prefix frontend run build
 ```
-Tests use synthetic `Observation`s. Webcam behavior is not covered by automated tests.
+`tests/conftest.py` has `Clock` (feeds frames at 5 fps) and `obs()` helpers. The API tests point `CTRLF_*` at tmp paths, including a copy of `regions.json`.
 
 ## Conventions
-- Never store or commit frames, recordings, DBs or weights (see .gitignore).
-- Don't fabricate detections in live mode. Synthetic data belongs only in tests.
-- Keep modules small. Backend modules are imported flat (`from memory import ...`), and the server runs from `backend/`.
+- Never fabricate detections, photos or locations in live mode. Synthetic data belongs only in tests.
+- Never commit DBs, photos, frames or weights (`backend/data/` and `*.pt` are git-ignored).
+- Re-observing an item from a new camera view is `reconfirmed`, never a movement event.
+- Work happens on feature branches. Don't push to main or merge without approval.
 
-## Current limitations
-- One instance per category. Two cups merge into one record (the most confident detection wins each frame).
-- Only COCO classes (no keys, wallets or headphones).
-- Regions are 2D rectangles in image space. No depth, no occlusion reasoning, and no calibration UI (edit `regions.json`).
-- Polling rather than push (fine for the MVP).
-- Live webcam path was verified only with a video-file source in the dev session (camera permission was unavailable). The first real-webcam run still needs manual verification.
+## Limitations
+- One item per category. Only COCO classes (no keys, wallets or headphones).
+- Areas are 2D image rectangles. Map positions are approximate.
+- "Touched but not moved" is not detected; there's no hand tracking.
+- Thresholds were tuned on synthetic tests. Real-camera tuning is still pending (see the README live checklist).
+- Polling, not push.
 
 ## Next priorities
-1. Region calibration UI (drag rectangles over the camera preview → save `regions.json`).
-2. Multi-instance support (track-level identities with appearance embeddings).
-3. Custom or fine-tuned classes for keys, wallet and headphones.
-4. WebSocket/SSE push instead of polling.
-5. Hand-object interaction to explain *who* moved what. Wake-word activation via `lib/voice.ts listen()`.
+1. Live tuning of `SETTLE_SECONDS`, `MOVE_THRESHOLD` and the motion threshold with the demo setup.
+2. MediaPipe hands for pick-up/put-down evidence (optional; must not weaken the snapshot path).
+3. Multi-instance items. Custom classes (keys, wallet).
+4. 3D room view from an Apple RoomPlan export (stretch goal, only with real scan data).
