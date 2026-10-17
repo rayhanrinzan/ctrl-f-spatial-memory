@@ -1,30 +1,41 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Trash2 } from 'lucide-react'
+import { LayoutGrid, Map as MapIcon } from 'lucide-react'
 import { api } from './lib/api'
 import type { Health, MoveEvent, QueryResult, Region, TrackedObject } from './lib/api'
+import { ObjectList } from './components/ObjectList'
+import { ObjectDetail } from './components/ObjectDetail'
 import { RoomMap } from './components/RoomMap'
 import { SearchPanel } from './components/SearchPanel'
 import { CameraPanel } from './components/CameraPanel'
 import { ActivityFeed } from './components/ActivityFeed'
+import { PrivacyPanel } from './components/PrivacyPanel'
+import { RepositionFlow } from './components/RepositionFlow'
 
-const POLL_MS = 1000
+const POLL_MS = 1500
+type View = 'list' | 'map'
+
+function readView(): View {
+  try {
+    return localStorage.getItem('keepsake.view') === 'map' ? 'map' : 'list'
+  } catch {
+    return 'list'
+  }
+}
 
 function StatusPill({ health, offline }: { health: Health | null; offline: boolean }) {
-  const cam = health?.camera
+  const paused = health && health.mode !== 'MONITORING'
   const [label, dot] = offline
-    ? ['Server offline', 'bg-rose-500']
-    : cam === 'active'
-      ? ['Camera active', 'bg-emerald-400']
-      : cam === 'disabled'
-        ? ['Camera off', 'bg-zinc-500']
-        : cam === 'error'
-          ? ['Camera unavailable', 'bg-amber-400']
-          : ['Connecting…', 'bg-zinc-500']
+    ? ['Keepsake is offline', 'bg-red-500']
+    : !health ? ['Connecting…', 'bg-stone-400']
+      : paused ? ['Monitoring paused', 'bg-amber-500']
+        : health.camera === 'active' ? ['Camera on · watching', 'bg-sage-600']
+          : health.camera === 'disabled' ? ['Camera off', 'bg-stone-400']
+            : ['Camera unavailable', 'bg-amber-500']
   return (
-    <span className="flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-300">
-      <span className="relative flex size-2">
-        {cam === 'active' && !offline && <span className="ping-ring absolute inset-0 rounded-full bg-emerald-400" />}
-        <span className={`relative size-2 rounded-full ${dot}`} />
+    <span role="status" className="flex items-center gap-2 rounded-full bg-card px-3.5 py-2 text-sm font-medium shadow-card">
+      <span className="relative flex size-2.5">
+        {health?.camera === 'active' && !paused && !offline && <span className="pulse-ring absolute inset-0 rounded-full bg-sage-600" />}
+        <span className={`relative size-2.5 rounded-full ${dot}`} />
       </span>
       {label}
     </span>
@@ -37,17 +48,20 @@ export default function App() {
   const [regions, setRegions] = useState<Region[]>([])
   const [objects, setObjects] = useState<TrackedObject[]>([])
   const [events, setEvents] = useState<MoveEvent[]>([])
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [view, setView] = useState<View>(readView)
+  const [openId, setOpenId] = useState<string | null>(null)
   const [highlightId, setHighlightId] = useState<string | null>(null)
+  const [repositioning, setRepositioning] = useState(false)
   const [now, setNow] = useState(Date.now())
 
   const refresh = useCallback(async () => {
     try {
-      const [h, o, e] = await Promise.all([api.health(), api.objects(), api.events(15)])
+      const [h, o, e] = await Promise.all([api.health(), api.objects(), api.events(12)])
       setHealth(h)
       setObjects(o)
       setEvents(e)
       setOffline(false)
+      if (h.mode !== 'MONITORING') setRepositioning(true)
     } catch {
       setOffline(true)
     }
@@ -62,82 +76,98 @@ export default function App() {
   }, [refresh])
 
   useEffect(() => {
+    try {
+      localStorage.setItem('keepsake.view', view)
+    } catch {
+      /* storage unavailable */
+    }
+  }, [view])
+
+  useEffect(() => {
     if (!highlightId) return
-    const t = setTimeout(() => setHighlightId(null), 6000)
+    const t = setTimeout(() => setHighlightId(null), 8000)
     return () => clearTimeout(t)
   }, [highlightId])
 
-  function onQuery(r: QueryResult) {
-    if (r.object) {
-      setHighlightId(r.object.object_id)
-      setSelectedId(r.object.object_id)
+  function onAnswer(r: QueryResult) {
+    if (!r.object) return
+    setHighlightId(r.object.object_id)
+    setOpenId(r.object.object_id)
+  }
+
+  async function startReposition() {
+    try {
+      await api.reposition('start')
+      setRepositioning(true)
+      refresh()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Could not start repositioning')
     }
   }
 
-  async function clearMemory() {
-    if (!confirm('Forget all remembered object locations and movement history?')) return
-    await api.clear().catch(() => setOffline(true))
-    setSelectedId(null)
-    refresh()
-  }
+  const closeReposition = useCallback(() => {
+    setRepositioning(false)
+    api.regions().then(setRegions).catch(() => undefined)
+  }, [])
 
-  const visibleCount = objects.filter((o) => o.visible).length
+  const open = objects.find((o) => o.object_id === openId)
+  const seenCount = objects.filter((o) => o.seen).length
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:py-8">
-      <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
+    <div className="mx-auto max-w-7xl px-4 pt-6 pb-16 sm:px-6 lg:pt-10">
+      <header className="enter mb-6 flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Ctrl<span className="text-emerald-400">+</span>F
-          </h1>
-          <p className="text-sm text-zinc-400">Your room remembers, so you don't have to.</p>
+          <h1 className="font-serif text-4xl tracking-tight sm:text-5xl">Keepsake</h1>
+          <p className="mt-1 text-lg text-muted">Your room remembers, so you don&apos;t have to.</p>
         </div>
         <StatusPill health={health} offline={offline} />
       </header>
 
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_380px]">
-        <div className="space-y-5">
-          <SearchPanel onResult={onQuery} />
-          <section>
-            <div className="mb-2 flex items-end justify-between">
-              <h2 className="text-sm font-medium text-zinc-300">Room map</h2>
-              <span className="text-xs text-zinc-500">
-                {objects.length} remembered · {visibleCount} in view
-              </span>
-            </div>
-            <RoomMap
-              regions={regions}
-              objects={objects}
-              selectedId={selectedId}
-              highlightId={highlightId}
-              onSelect={setSelectedId}
-              now={now}
-            />
-            <div className="mt-2 flex items-center gap-4 text-xs text-zinc-500">
-              <span className="flex items-center gap-1.5">
-                <span className="size-2.5 rounded-full bg-emerald-500" /> Visible now
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="size-2.5 rounded-full border border-dashed border-zinc-400 bg-zinc-800" /> Last seen
-              </span>
-            </div>
-          </section>
-        </div>
+      {offline && (
+        <p className="mb-5 rounded-2xl bg-amber-50 p-4 text-[15px] text-amber-ink">
+          Can&apos;t reach Keepsake right now. The last memories loaded are shown below; start the backend to see updates.
+        </p>
+      )}
 
-        <aside className="space-y-5">
-          <CameraPanel health={health} />
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <main className="min-w-0 space-y-6">
+          <SearchPanel onResult={onAnswer} />
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div role="tablist" aria-label="View" className="inline-flex rounded-full bg-stone-200/70 p-1">
+              {([['list', 'List', LayoutGrid], ['map', 'Map', MapIcon]] as const).map(([key, label, Icon]) => (
+                <button
+                  key={key}
+                  role="tab"
+                  aria-selected={view === key}
+                  onClick={() => setView(key)}
+                  className={`flex min-h-11 items-center gap-2 rounded-full px-5 text-[15px] font-semibold transition-[background-color,color] duration-150 ${view === key ? 'bg-card text-ink shadow-card' : 'text-stone-600 hover:text-ink'}`}
+                >
+                  <Icon className="size-4" /> {label}
+                </button>
+              ))}
+            </div>
+            <span className="text-[15px] text-muted">{seenCount} of {objects.length} items remembered</span>
+          </div>
+
+          {view === 'list' ? (
+            <ObjectList objects={objects} now={now} highlightId={highlightId} onOpen={setOpenId} />
+          ) : (
+            <RoomMap regions={regions} objects={objects} highlightId={highlightId} onOpen={setOpenId} />
+          )}
+        </main>
+
+        <aside className="space-y-6">
+          <CameraPanel health={health} onReposition={startReposition} />
           <ActivityFeed events={events} />
-          <section className="rounded-2xl border border-zinc-800 bg-zinc-900/60 p-4 text-xs leading-relaxed text-zinc-500">
-            Video is processed on this computer and never saved. Only object names, positions and times are stored.
-            <button
-              onClick={clearMemory}
-              className="mt-3 flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-zinc-300 hover:border-rose-500/60 hover:text-rose-300"
-            >
-              <Trash2 className="size-3.5" /> Clear memory
-            </button>
-          </section>
+          <PrivacyPanel health={health} onChanged={refresh} />
         </aside>
       </div>
+
+      {open && <ObjectDetail key={open.object_id} o={open} now={now} onClose={() => setOpenId(null)} />}
+      {repositioning && health && health.mode !== 'MONITORING' && (
+        <RepositionFlow health={health} regions={regions} onRegions={setRegions} onClose={closeReposition} />
+      )}
     </div>
   )
 }

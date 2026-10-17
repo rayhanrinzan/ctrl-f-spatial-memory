@@ -1,45 +1,55 @@
 import { useState } from 'react'
-import { CameraOff } from 'lucide-react'
+import { CameraOff, Move } from 'lucide-react'
 import { api } from '../lib/api'
 import type { Health } from '../lib/api'
 
-export function CameraPanel({ health }: { health: Health | null }) {
+export function LiveFeed({ health, className = '' }: { health: Health | null; className?: string }) {
   const [streamKey, setStreamKey] = useState(0)
   const active = health?.camera === 'active'
-
   return (
-    <section className="overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900/60">
-      <div className="flex items-center justify-between px-4 py-3">
-        <h2 className="text-sm font-medium text-zinc-300">Live camera</h2>
-        <span className="text-xs text-zinc-500">{active ? `${health?.fps ?? 0} fps · on-device` : ''}</span>
-      </div>
-      <div className="relative aspect-video bg-black">
-        {active ? (
-          <img
-            key={streamKey}
-            src={`${api.cameraUrl}?k=${streamKey}`}
-            onError={() => setTimeout(() => setStreamKey((k) => k + 1), 2000)}
-            alt="Live camera with detections"
-            className="size-full object-contain"
-          />
-        ) : (
-          <div className="flex size-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-zinc-500">
-            <CameraOff className="size-6" />
-            <p>{health ? health.error ?? `Camera ${health.camera}` : 'Connecting to server…'}</p>
-          </div>
-        )}
-      </div>
-      {active && health.warning && (
-        <p className="border-t border-zinc-800 px-4 py-2 text-xs text-amber-300">{health.warning}</p>
+    <div className={`relative overflow-hidden bg-stone-900 ${className}`}>
+      {active ? (
+        <img
+          key={streamKey}
+          src={`${api.cameraUrl}?k=${streamKey}`}
+          onError={() => setTimeout(() => setStreamKey((k) => k + 1), 2000)}
+          alt="Live camera view with detected items outlined"
+          className="size-full object-contain"
+        />
+      ) : (
+        <div className="flex size-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-stone-300">
+          <CameraOff className="size-6" />
+          <p>{!health ? 'Connecting to Keepsake…' : health.camera === 'disabled' ? 'Camera is turned off' : health.error ?? 'Starting camera…'}</p>
+        </div>
       )}
+    </div>
+  )
+}
+
+export function CameraPanel({ health, onReposition }: { health: Health | null; onReposition: () => void }) {
+  const active = health?.camera === 'active'
+  return (
+    <section className="overflow-hidden rounded-3xl bg-card shadow-card">
+      <div className="flex items-center justify-between gap-2 px-5 pt-4 pb-3">
+        <h2 className="font-serif text-lg">Camera</h2>
+        <button
+          onClick={onReposition}
+          disabled={!health || health.camera === 'disabled'}
+          className="press flex min-h-10 items-center gap-1.5 rounded-full bg-stone-100 px-3.5 text-sm font-medium hover:bg-stone-200 disabled:opacity-50"
+        >
+          <Move className="size-4" /> Reposition
+        </button>
+      </div>
+      <LiveFeed health={health} className="aspect-video" />
+      {health?.warning && <p className="bg-amber-50 px-5 py-2.5 text-sm text-amber-ink">{health.warning}</p>}
       {active && (
-        <div className="flex min-h-10 flex-wrap gap-1.5 px-4 py-2.5">
+        <div className="flex min-h-11 flex-wrap items-center gap-1.5 px-5 py-3">
           {health.detections.length === 0 ? (
-            <span className="text-xs text-zinc-500">No tracked objects in view</span>
+            <span className="text-sm text-muted">No tracked items in view</span>
           ) : (
             health.detections.map((d, i) => (
-              <span key={i} className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-300">
-                {d.category} · {Math.round(d.confidence * 100)}%
+              <span key={i} className="rounded-full bg-sage-50 px-2.5 py-1 text-xs font-medium text-sage-700">
+                {d.name} · {Math.round(d.confidence * 100)}%
               </span>
             ))
           )}

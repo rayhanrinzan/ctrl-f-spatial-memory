@@ -163,7 +163,8 @@ def get_snapshot_image(snapshot_id: int):
 
 @app.get("/api/events")
 def get_events(limit: int = 50):
-    return db.get_events(limit)
+    names = {c["object_id"]: c["name"] for c in CATALOG}
+    return [{**e, "name": names.get(e["object_id"], e["name"])} for e in db.get_events(limit)]
 
 
 class Query(BaseModel):

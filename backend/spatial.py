@@ -69,10 +69,11 @@ def validate_regions(items: list[dict]) -> list[Region]:
 
 def save_regions(regions: list[Region], path: str | os.PathLike | None = None) -> None:
     path = Path(path or os.getenv("CTRLF_REGIONS", DEFAULT_REGIONS_PATH))
-    data = {"_comment": "camera: [x0, y0, x1, y1] normalized to the camera frame. "
-                        "map: [x0, y0, x1, y1] normalized to the dashboard blueprint.",
-            "regions": [{"name": r.name, "camera": [round(v, 4) for v in (r.x0, r.y0, r.x1, r.y1)],
-                         "map": [round(v, 4) for v in r.map]} for r in regions]}
+    rows = [json.dumps({"name": r.name, "camera": [round(v, 4) for v in (r.x0, r.y0, r.x1, r.y1)],
+                        "map": [round(v, 4) for v in r.map]}) for r in regions]
+    text = ('{\n  "_comment": "camera: [x0, y0, x1, y1] normalized to the camera frame. '
+            'map: [x0, y0, x1, y1] normalized to the dashboard blueprint.",\n  "regions": [\n    '
+            + ",\n    ".join(rows) + "\n  ]\n}\n")
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.write_text(text)
     tmp.replace(path)
